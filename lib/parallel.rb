@@ -78,8 +78,7 @@ module Parallel
 
     def wait
       Process.wait(pid)
-    rescue Interrupt
-    rescue Errno::ECHILD
+    rescue Interrupt, Errno::ECHILD
       # process died
     end
   end
@@ -168,12 +167,15 @@ module Parallel
       end
 
       def kill(thing)
-        Process.kill(:KILL, thing)
-        Process.waitpid(thing)
-      rescue Errno::ESRCH
-      rescue Errno::ECHILD
-        # some linux systems already automatically killed the children at this point
-        # so we just ignore them not being there
+        Array(thing).each do |pid|
+          begin
+            Process.kill(:KILL, pid)
+            Process.waitpid(pid)
+          rescue Errno::ESRCH, Errno::ECHILD
+            # some linux systems already automatically killed the children at this point
+            # so we just ignore them not being there
+          end
+        end
       end
 
       private
@@ -201,19 +203,30 @@ module Parallel
 
   class << self
     def in_threads(options={:count => 2})
-      begin
-        count, _ = extract_count_from_options(options)
-        threads = Array.new(count).each_with_index.map do |_, i|
-          Thread.new do
-            Thread.current.abort_on_exception = true
-            yield(i)
+      count, _ = extract_count_from_options(options)
+      threads = Array.new(count).each_with_index.map do |_, i|
+        Thread.new { yield(i) }
+      end
+      # threads.each(&:value)
+
+      results = []
+      while threads.count > 0
+        threads.each do |thread|
+          if [false, nil, 'aborting'].include?(thread.status)
+            results << thread.value
+            threads.delete(thread)
           end
         end
-        threads.map!(&:value)
-      rescue Parallel::Kill => e
-        kill_child_processes
-        kill_threads(threads)
+        if threads.any? && threads.all? { |t| t.status == 'sleep' }
+          # Deadlocked. Join to raise error.
+          results = threads.map(&:join)
+        end
       end
+      results
+
+    rescue Parallel::Kill => e
+      UserInterruptHandler.kill(child_processes(Process.pid))
+      kill_threads(threads)
     end
 
     def in_processes(options = {}, &block)
@@ -458,22 +471,14 @@ module Parallel
       results
     end
 
-    # kill all children of this process
-    def kill_child_processes
-      child_processes(Process.pid).each do |pid|
-        UserInterruptHandler.kill(pid)
-      end
-    end
-
-    # kill threads asynchronously (using new threads)
     def kill_threads(threads)
-      threads.reject(&:nil?).each(&:kill)
+      threads.compact.each(&:kill)
     end
 
     # get child pids ordered by youngest descendants first
     def child_processes(pid)
       pids = `pgrep -P #{pid}`.split("\n").map(&:to_i)
-      pids.map { |p| child_processes(p) }.flatten + pids
+      pids.flat_map { |p| child_processes(p) } + pids
     end
 
     # options is either a Integer or a Hash with :count
