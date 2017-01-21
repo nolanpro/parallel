@@ -207,26 +207,27 @@ module Parallel
       threads = Array.new(count).each_with_index.map do |_, i|
         Thread.new { yield(i) }
       end
-      # threads.each(&:value)
 
       results = []
       while threads.count > 0
         threads.each do |thread|
           if [false, nil, 'aborting'].include?(thread.status)
-            results << thread.value
+            begin
+              results << thread.value
+            rescue Parallel::Kill => e
+              UserInterruptHandler.kill(child_processes(Process.pid))
+              kill_threads(threads)
+            end
             threads.delete(thread)
           end
         end
-        if threads.any? && threads.all? { |t| t.status == 'sleep' }
-          # Deadlocked. Join to raise error.
-          results = threads.map(&:join)
-        end
+        # if threads.any? && threads.all? { |t| t.status == 'sleep' }
+        #   # Deadlocked. Join to raise error.
+        #   puts "---------------- deadlock ---------------"
+        #   results = threads.map(&:join)
+        # end
       end
       results
-
-    rescue Parallel::Kill => e
-      UserInterruptHandler.kill(child_processes(Process.pid))
-      kill_threads(threads)
     end
 
     def in_processes(options = {}, &block)
@@ -340,7 +341,7 @@ module Parallel
       in_threads(options) do |worker_num|
         self.worker_number = worker_num
         # as long as there are more jobs, work on one of them
-        while !exception && set = job_factory.next
+        while set = job_factory.next
           begin
             item, index = set
             result = with_instrumentation item, index, options do
@@ -348,10 +349,13 @@ module Parallel
             end
             results_mutex.synchronize { results[index] = result }
           rescue Parallel::Kill => e
+            exception = e
             raise e
           rescue StandardError => e
             exception = e
+            # Thread.exit
           end
+          break if exception
         end
       end
 
@@ -374,7 +378,6 @@ module Parallel
 
           begin
             loop do
-              break if exception
               item, index = job_factory.next
               break unless index
 
@@ -389,15 +392,25 @@ module Parallel
                   worker.work(job_factory.pack(item, index))
                 end
                 results_mutex.synchronize { results[index] = result } # arrays are not threads safe on jRuby
-              rescue StandardError => e
-                exception = e
-                if Parallel::Kill === exception
-                  (workers - [worker]).each do |w|
-                    w.thread.kill unless w.thread.nil?
-                    UserInterruptHandler.kill(w.pid)
-                  end
+              rescue Parallel::Kill => e
+                (workers - [worker]).each do |w|
+                  w.thread.kill unless w.thread.nil?
+                  UserInterruptHandler.kill(w.pid)
                 end
+                results = nil
+                raise e
+              rescue StandardError => e
+                results_mutex.synchronize { exception = e }
+                # UserInterruptHandler.kill(child_processes(worker.pid))
+                Thread.exit
+                # if Parallel::Kill === exception
+                #   (workers - [worker]).each do |w|
+                #     w.thread.kill unless w.thread.nil?
+                #     UserInterruptHandler.kill(w.pid)
+                #   end
+                # end
               end
+              break if exception
             end
           ensure
             worker.stop if worker
